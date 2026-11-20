@@ -218,8 +218,10 @@ export type ProjectionSettlementCandidate = Pick<
   OrchestrationV2ThreadShell,
   | "id"
   | "projectId"
+  | "providerInstanceId"
   | "branch"
   | "worktreePath"
+  | "interactionMode"
   | "lineage"
   | "pullRequests"
   | "linkedPullRequest"
@@ -246,6 +248,7 @@ export type ProjectionSettlementCandidate = Pick<
 > &
   Pick<OrchestrationV2AppThread, "lastSnoozeWakeAt"> & {
     readonly latestUserAuthoredMessageAt: DateTime.Utc | null;
+    readonly latestRunAutoSettleLearningActivityAt?: DateTime.Utc;
   };
 
 const ProjectionCheckpointContext = Schema.Struct({
@@ -672,6 +675,7 @@ export interface ProjectionStoreV2Shape {
   readonly getSettlementCandidates: (
     threadId?: ThreadId,
   ) => Effect.Effect<ReadonlyArray<ProjectionSettlementCandidate>, ProjectionStoreV2Error>;
+  readonly hasActiveAutoSettleLearningCapture: Effect.Effect<boolean, ProjectionStoreV2Error>;
   readonly getThreadsWithPullRequests: (
     threadId?: ThreadId,
   ) => Effect.Effect<ReadonlyArray<ProjectionThreadPullRequests>, ProjectionStoreV2Error>;
@@ -1244,6 +1248,7 @@ type ShellThreadRow = {
   readonly latest_run_started_at: string | null;
   readonly latest_run_completed_at: string | null;
   readonly latest_run_stop_requested: number;
+  readonly latest_run_learning_capture: number;
   readonly latest_run_background_wake: number;
   readonly active_run_id: string | null;
   readonly active_run_status: string | null;
@@ -1289,7 +1294,7 @@ type SettlementThreadRow = Pick<
   | "latest_run_completed_at"
   | "latest_user_message_at"
   | "latest_user_authored_message_at"
->;
+> & { readonly latest_run_auto_settle_learning_activity_at: string | null };
 
 type ShellRunItemCountRow = {
   readonly thread_id: string;
@@ -1944,6 +1949,10 @@ export function threadShellFromProjection(
       projection.turnItems.some(
         (item) => item.runId === latestRun.id && item.type === "run_interrupt_request",
       ),
+    ...(latestRun?.autoSettleLearningActivityAt !== undefined &&
+    noUserMessageAfterLearningCapture(latestUserAuthoredMessageAt, latestRun.requestedAt)
+      ? { latestRunQuietCompletion: true }
+      : {}),
     latestRunBackgroundWake:
       latestRun != null && isBackgroundWakeRunForShell(latestRun, projection),
     activeRunId: activeRun?.id ?? null,
@@ -2027,6 +2036,17 @@ function activeProviderGoalForShell(
   return providerThreads.find((thread) => thread.id === activeProviderThreadId)?.goal ?? null;
 }
 
+export function noUserMessageAfterLearningCapture(
+  latestUserAuthoredMessageAt: DateTime.Utc | null,
+  captureRequestedAt: DateTime.Utc | null | undefined,
+): boolean {
+  return (
+    latestUserAuthoredMessageAt === null ||
+    (captureRequestedAt != null &&
+      DateTime.Order(latestUserAuthoredMessageAt, captureRequestedAt) <= 0)
+  );
+}
+
 function isSilentRunForShell(
   run: OrchestrationV2ThreadProjection["runs"][number],
   projection: Pick<OrchestrationV2ThreadProjection, "messages" | "turnItems">,
@@ -2083,6 +2103,7 @@ type ShellThreadState = {
   readonly latestRunStartedAt: DateTime.Utc | null;
   readonly latestRunCompletedAt: DateTime.Utc | null;
   readonly latestRunStopRequested: boolean;
+  readonly latestRunQuietCompletion: boolean;
   readonly latestRunBackgroundWake: boolean;
   readonly activeRunId: RunId | null;
   readonly blockedOnThreadWait: boolean;
@@ -2254,6 +2275,7 @@ function shellFromState(input: {
     latestRunStartedAt: input.state.latestRunStartedAt,
     latestRunCompletedAt: input.state.latestRunCompletedAt,
     latestRunStopRequested: input.state.latestRunStopRequested,
+    ...(input.state.latestRunQuietCompletion ? { latestRunQuietCompletion: true } : {}),
     latestRunBackgroundWake: input.state.latestRunBackgroundWake,
     activeRunId: input.state.activeRunId,
     blockedOnThreadWait: input.state.blockedOnThreadWait,
@@ -8319,6 +8341,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 WHERE stop_request.thread_id = t.thread_id AND stop_request.run_id = presented.run_id
                   AND stop_request.type = 'run_interrupt_request'
               ) AS latest_run_stop_requested,
+              json_extract(presented.payload_json, '$.autoSettleLearningActivityAt') IS NOT NULL
+                AS latest_run_learning_capture,
               ${isBackgroundWakeShellRun("presented")} AS latest_run_background_wake,
               active.run_id AS active_run_id,
               active.status AS active_run_status,
@@ -8715,6 +8739,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       return { providerThreadsByThreadId, pendingTurnItemsByThreadId };
     });
 
+    const hasActiveAutoSettleLearningCapture = sql<{ active: 1 }>`
+      SELECT 1 AS active
+      FROM orchestration_v2_projection_runs
+      WHERE status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+        AND json_extract(payload_json, '$.autoSettleLearningActivityAt') IS NOT NULL
+      LIMIT 1
+    `.pipe(
+      Effect.map((rows) => rows.length > 0),
+      Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+    );
+
     const getSettlementCandidates: ProjectionStoreV2Shape["getSettlementCandidates"] = (threadId) =>
       sql
         .withTransaction(
@@ -8722,6 +8757,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             const rows = yield* sql<SettlementThreadRow>`
             SELECT t.thread_id, t.payload_json,
               r.run_id AS latest_run_id,
+              json_extract(r.payload_json, '$.autoSettleLearningActivityAt') AS latest_run_auto_settle_learning_activity_at,
               r.status AS latest_run_status,
               r.requested_at AS latest_run_requested_at,
               json_extract(r.payload_json, '$.startedAt') AS latest_run_started_at,
@@ -8815,6 +8851,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   snoozedAt: thread.snoozedAt ?? null,
                   status,
                   latestRunId,
+                  ...(row.latest_run_auto_settle_learning_activity_at === null
+                    ? {}
+                    : {
+                        latestRunAutoSettleLearningActivityAt: DateTime.makeUnsafe(
+                          row.latest_run_auto_settle_learning_activity_at,
+                        ),
+                      }),
                   latestRunRequestedAt:
                     row.latest_run_requested_at === null
                       ? null
@@ -9071,6 +9114,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           latestRunStartedAt,
           latestRunCompletedAt,
           latestRunStopRequested,
+          latestRunQuietCompletion:
+            latestRunId === row.latest_run_id &&
+            row.latest_run_learning_capture === 1 &&
+            noUserMessageAfterLearningCapture(latestUserAuthoredMessageAt, latestRunRequestedAt),
           latestRunBackgroundWake,
           activeRunId: row.active_run_id === null ? null : RunId.make(row.active_run_id),
           blockedOnThreadWait: deriveBlockedOnThreadWait({
@@ -9345,6 +9392,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               activityRunStatus: state.activityRunStatus,
               latestRunCompletedAt: state.latestRunCompletedAt,
               latestRunStopRequested: state.latestRunStopRequested,
+              ...(state.latestRunQuietCompletion ? { latestRunQuietCompletion: true } : {}),
               latestRunBackgroundWake: state.latestRunBackgroundWake,
               pendingRuntimeRequest: state.pendingRuntimeRequest,
               pendingBackgroundTasks: state.pendingBackgroundTasks,
@@ -9750,6 +9798,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getThread: readOnReader(getThread),
       findThread: readOnReader(findThread),
       getSettlementCandidates: readOnReader(getSettlementCandidates),
+      hasActiveAutoSettleLearningCapture: hasActiveAutoSettleLearningCapture.pipe(
+        NodeSqliteClient.readOnly,
+      ),
       getThreadsWithPullRequests: readOnReader(getThreadsWithPullRequests),
       getThreadTitles: readOnReader(getThreadTitles),
       getThreadLinkMetadata: readOnReader(getThreadLinkMetadata),

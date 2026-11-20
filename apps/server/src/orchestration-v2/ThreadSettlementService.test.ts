@@ -1,6 +1,7 @@
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { assert, describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import * as ConfigProvider from "effect/ConfigProvider";
 import {
   DEFAULT_SERVER_SETTINGS,
   ProjectId,
@@ -16,6 +17,7 @@ import {
   type OrchestrationV2AppThread,
   type OrchestrationV2Command,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2ServerCommand,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2ThreadShell,
   type PullRequestSummary,
@@ -56,7 +58,10 @@ function at(offsetMs: number): DateTime.Utc {
 }
 
 type SettlementShell = OrchestrationV2ThreadShell &
-  Pick<ProjectionStore.ProjectionSettlementCandidate, "latestUserAuthoredMessageAt">;
+  Pick<
+    ProjectionStore.ProjectionSettlementCandidate,
+    "latestUserAuthoredMessageAt" | "latestRunAutoSettleLearningActivityAt"
+  >;
 
 function shell(overrides: Partial<SettlementShell> = {}): SettlementShell {
   return {
@@ -481,6 +486,10 @@ describe("autoSettlementSettingsKey", () => {
 });
 
 type AutoSettleCommand = Extract<OrchestrationV2Command, { readonly type: "thread.auto-settle" }>;
+type CaptureLearningsCommand = Extract<
+  OrchestrationV2ServerCommand,
+  { readonly type: "thread.auto-settle.capture-learnings" }
+>;
 
 const testCrypto = SecureRandom.make((size) => new Uint8Array(size).fill(1));
 
@@ -605,6 +614,8 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
   const mergedPullRequests = yield* PubSub.unbounded<PullRequestService.PullRequestMergeEvent>();
   const pullRequestRefreshes = yield* PubSub.unbounded<number>();
   const commands = yield* Ref.make<ReadonlyArray<AutoSettleCommand>>([]);
+  const captureCommands = yield* Ref.make<ReadonlyArray<CaptureLearningsCommand>>([]);
+  const activeCapture = yield* Ref.make(false);
   const branchCalls = yield* Ref.make<
     ReadonlyArray<{ readonly cwd: string; readonly branch: string }>
   >([]);
@@ -660,6 +671,12 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
     });
 
   const dispatch: Orchestrator.OrchestratorV2Shape["dispatch"] = (command) => {
+    if (command.type === "thread.auto-settle.capture-learnings") {
+      return Ref.update(captureCommands, (recorded) => [...recorded, command]).pipe(
+        Effect.andThen(Ref.set(activeCapture, true)),
+        Effect.as({ sequence: 1, storedEvents: [] }),
+      );
+    }
     if (command.type !== "thread.auto-settle") {
       return Effect.die(new Error(`Unexpected command: ${command.type}`));
     }
@@ -690,6 +707,7 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
     }),
     Layer.mock(ProjectionStore.ProjectionStoreV2)({
       ...options.projections,
+      hasActiveAutoSettleLearningCapture: Ref.get(activeCapture),
       getSettlementCandidates: (threadId) =>
         Ref.update(candidateReads, (reads) => [...reads, threadId]).pipe(
           Effect.andThen(Ref.updateAndGet(snapshotReadCount, (count) => count + 1)),
@@ -770,6 +788,8 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
     snapshotReads,
     candidateReads,
     commands,
+    captureCommands,
+    activeCapture,
     branchCalls,
     summaryCalls,
     summaryRecovery,
@@ -847,6 +867,116 @@ const settledEvent = (thread: OrchestrationV2AppThread): OrchestrationV2DomainEv
 });
 
 describe("ThreadSettlementServiceV2 worker", () => {
+  it.effect("limits capture starts and preserves inactivity after a failed capture", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(NOW));
+      const now = DateTime.makeUnsafe(NOW);
+      const originalRunId = RunId.make("original-work");
+      const captureRunId = RunId.make("learning-capture");
+      const originalActivity = DateTime.makeUnsafe(Date.parse(NOW) - 8 * DAY_MS);
+      const thread = makeThread("captured-learnings", {
+        latestRunId: originalRunId,
+        latestRunRequestedAt: originalActivity,
+        latestRunCompletedAt: originalActivity,
+        latestUserMessageAt: originalActivity,
+        latestUserAuthoredMessageAt: originalActivity,
+        status: "completed",
+      });
+      const disabledProvider = ProviderInstanceId.make("disabled-for-project");
+      const disabledThread = makeThread("disabled-capture-provider", {
+        ...thread,
+        id: ThreadId.make("disabled-capture-provider"),
+        providerInstanceId: disabledProvider,
+      });
+      const otherThread = makeThread("another-capture-candidate", {
+        ...thread,
+        id: ThreadId.make("another-capture-candidate"),
+      });
+      const fixture = yield* makeHarness({
+        snapshot: makeSnapshot([thread, otherThread, disabledThread]),
+        settings: {
+          ...DEFAULT_SERVER_SETTINGS,
+          sidebarAutoSettleAfterDays: 7,
+          projectSettingsOverrides: {
+            [thread.projectId]: { providerInstances: { [disabledProvider]: { enabled: false } } },
+          },
+        },
+      });
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+        yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+        const captures = yield* Ref.get(fixture.captureCommands);
+        assert.lengthOf(captures, 1);
+        const [capture] = captures;
+        assert.isDefined(capture);
+        assert.equal(capture.expectedLatestRunId, originalRunId);
+        assert.match(capture.text, /verified lesson/);
+        assert.deepEqual(
+          new Set((yield* Ref.get(fixture.commands)).map((command) => command.threadId)),
+          new Set(
+            [thread.id, otherThread.id, disabledThread.id].filter((id) => id !== capture.threadId),
+          ),
+        );
+        yield* Ref.set(fixture.commands, []);
+
+        const readyWhileCaptureWaits = {
+          ...thread,
+          id: ThreadId.make("ready-while-capture-waits"),
+        };
+        // A capture waiting on approval is active but absent from the settlement candidates.
+        yield* Ref.set(fixture.snapshots, makeSnapshot([readyWhileCaptureWaits]));
+        yield* fixture.updateSettings({ sidebarAutoSettleAfterDays: 6 });
+        yield* Queue.take(fixture.snapshotReads);
+        yield* service.drain;
+        assert.deepEqual(
+          (yield* Ref.get(fixture.commands)).map((command) => command.threadId),
+          [readyWhileCaptureWaits.id],
+        );
+        assert.lengthOf(yield* Ref.get(fixture.captureCommands), 1);
+        yield* Ref.set(fixture.commands, []);
+
+        yield* Ref.set(
+          fixture.snapshots,
+          makeSnapshot([
+            {
+              ...thread,
+              id: capture.threadId,
+              status: "failed",
+              latestRunId: captureRunId,
+              latestRunAutoSettleLearningActivityAt: capture.activityAt,
+              latestRunRequestedAt: now,
+              latestRunCompletedAt: now,
+              latestUserMessageAt: now,
+            },
+          ]),
+        );
+        yield* Ref.set(fixture.activeCapture, false);
+        yield* fixture.updateSettings({ sidebarAutoSettleAfterDays: 30 });
+        yield* Queue.take(fixture.snapshotReads);
+        yield* service.drain;
+        assert.isEmpty(yield* Ref.get(fixture.commands));
+
+        yield* fixture.updateSettings({ sidebarAutoSettleAfterDays: 7 });
+        yield* Queue.take(fixture.snapshotReads);
+        yield* service.drain;
+        const [settlement] = yield* Ref.get(fixture.commands);
+        assert.isDefined(settlement);
+        assert.equal(settlement.expectedLatestRunId, captureRunId);
+        assert.lengthOf(yield* Ref.get(fixture.captureCommands), 1);
+      }).pipe(
+        Effect.provide(
+          fixture.layer.pipe(
+            Layer.provide(
+              ConfigProvider.layer(
+                ConfigProvider.fromUnknown({ T3CODE_SAVE_LEARNINGS_ON_AUTO_SETTLE: true }),
+              ),
+            ),
+          ),
+        ),
+      );
+    }),
+  );
+
   it.effect("skips settings and PR decisions for recent branchless threads", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(Date.parse(NOW));

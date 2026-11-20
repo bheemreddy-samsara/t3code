@@ -57,6 +57,13 @@ To stop a worktree's dev stack when its thread settles, import the **Dev** actio
 keybinding. Its `stopOnSettle` option lets T3 stop the terminal and its child processes.
 Running `vp run dev` through an agent's own shell tool does not attach it to this lifecycle.
 
+To try learning capture before auto-settle in a development server, start it with
+`T3CODE_SAVE_LEARNINGS_ON_AUTO_SETTLE=true`. The extra turn asks the agent to save a
+reusable lesson to an already authorized learning destination or leave it in the thread.
+It uses the thread's selected provider and permissions and can run while clients are closed.
+The server runs one learning capture at a time and skips completion alerts for the background turn.
+Other eligible threads settle normally while that capture is in flight.
+
 ### State and ports
 
 Linked worktrees default to their own `.t3/userdata`, even when `T3CODE_HOME` is set.

@@ -49,20 +49,23 @@ describe("projectThreadAwarenessV2", () => {
     ...overrides,
   });
 
-  it("does not announce completion after a manual stop", () => {
-    const input = {
-      environmentId: "env-1" as EnvironmentId,
-      project,
-      thread: v2Thread({ status: "completed" }),
-    };
-    expect(projectThreadAwarenessV2(input)?.phase).toBe("completed");
-    expect(
-      projectThreadAwarenessV2({
-        ...input,
-        thread: { ...input.thread, latestRunStopRequested: true },
-      }),
-    ).toBeNull();
-  });
+  it.each(["latestRunStopRequested", "latestRunQuietCompletion"] as const)(
+    "does not announce completion with %s",
+    (field) => {
+      const input = {
+        environmentId: "env-1" as EnvironmentId,
+        project,
+        thread: v2Thread({ status: "completed" }),
+      };
+      expect(projectThreadAwarenessV2(input)?.phase).toBe("completed");
+      expect(
+        projectThreadAwarenessV2({
+          ...input,
+          thread: { ...input.thread, [field]: true },
+        }),
+      ).toBeNull();
+    },
+  );
 
   it.each([
     ["holds a wake run", true, [{ taskId: "watch", kind: "monitor" as const }], "running"],

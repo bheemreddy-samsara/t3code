@@ -640,6 +640,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.guest-message.dismiss":
     case "thread.settle":
     case "thread.auto-settle":
+    case "thread.auto-settle.capture-learnings":
     case "thread.unsettle":
     case "thread.snooze":
     case "thread.unsnooze":
@@ -7072,6 +7073,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    autoSettleLearningActivityAt?: DateTime.Utc,
   ) {
     // A compacted thread reads every run, but attempts, nodes, messages, provider turns and prompts
     // only for its recent runs and the runs this command names. An idle compaction reads in full:
@@ -8459,6 +8461,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         rootNodeId,
         activeAttemptId: attemptId,
         status: dispatchMode.type === "defer_start" ? "preparing" : "starting",
+        ...(autoSettleLearningActivityAt === undefined ? {} : { autoSettleLearningActivityAt }),
         queuePosition: null,
         requestedAt: now,
         startedAt: null,
@@ -9282,6 +9285,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         mergeBackHandoff?.id ??
         legacyImportRecoveryHandoff?.id ??
         null,
+      ...(autoSettleLearningActivityAt === undefined ? {} : { autoSettleLearningActivityAt }),
       ...(command.sourcePlanRef === undefined ? {} : { sourcePlanRef: command.sourcePlanRef }),
       ...(command.restartContinuationOfRunId === undefined
         ? {}
@@ -12215,7 +12219,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
 
   const loadProjectionForCommand = <K extends ProjectionRecordField>(
-    command: OrchestrationV2Command,
+    command: OrchestrationV2ServerCommand,
     fields: ReadonlyArray<K>,
     filter?: ProjectionRecordFilter,
   ) =>
@@ -15444,7 +15448,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.visit":
         yield* dispatchThreadVisit(command, events);
         break;
-      case "thread.auto-settle": {
+      case "thread.auto-settle":
+      case "thread.auto-settle.capture-learnings": {
         // Recheck live state; changes and explicit overrides take precedence over the sweep snapshot.
         const thread = yield* projectionStore
           .getThread(command.threadId)
@@ -15462,6 +15467,54 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             commandType: command.type,
             cause: `Thread ${command.threadId} changed before automatic settlement.`,
           });
+        }
+        if (command.expectedLatestRunId !== undefined) {
+          // Use the same visible run as the sweep, which skips successful idle compaction.
+          const [candidate] = yield* projectionStore
+            .getSettlementCandidates(command.threadId)
+            .pipe(mapDispatchError(command));
+          if (candidate?.latestRunId !== command.expectedLatestRunId) {
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause:
+                "The thread received another run or stopped qualifying for automatic settlement.",
+            });
+          }
+        }
+        if (command.type === "thread.auto-settle.capture-learnings") {
+          const projection = yield* loadProjectionForCommand(command, ["runs", "runtimeRequests"]);
+          const run = projection.runs.find(
+            (candidate) => candidate.id === command.expectedLatestRunId,
+          );
+          if (
+            run?.status !== "completed" ||
+            run.autoSettleLearningActivityAt !== undefined ||
+            threadHasUnfinishedWork(projection)
+          ) {
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: "The thread changed before the learning capture could start.",
+            });
+          }
+          yield* dispatchMessage(
+            {
+              type: "message.dispatch",
+              commandId: command.commandId,
+              threadId: command.threadId,
+              messageId: MessageId.make(command.commandId),
+              text: command.text,
+              attachments: [],
+              dispatchMode: { type: "start_immediately" },
+              createdBy: "agent",
+              creationSource: "server",
+            },
+            events,
+            effects,
+            command.activityAt,
+          );
+          break;
         }
         yield* dispatchThreadMutation(
           {

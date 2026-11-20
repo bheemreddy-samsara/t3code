@@ -116,6 +116,7 @@ const thread = {
   hasPendingApprovals: false,
   hasPendingUserInput: false,
   pendingRequestId: "request-1",
+  latestRunQuietCompletion: false,
   session: null as { status: string } | null,
   latestTurn: { turnId: "turn", state: "running", completedAt: null as string | null },
 };
@@ -146,6 +147,7 @@ function toV2ThreadShell(input: typeof thread) {
     createdBy: "user",
     creationSource: "web",
     latestRunId: latestTurn.turnId,
+    latestRunQuietCompletion: input.latestRunQuietCompletion,
     activeRunId: null,
     status:
       latestTurn.state === "completed"
@@ -279,19 +281,29 @@ it.each(["hasPendingApprovals", "hasPendingUserInput"] as const)(
   },
 );
 
-it("presents completion notifications and sound as soon as the shell completes", async () => {
-  await using app = setup();
-  state.mode = "notifications-and-sound";
-  app.start();
-  state.shells.set(
-    "one",
-    shell({
-      latestTurn: { turnId: "turn", state: "completed", completedAt: "2026-09-13T07:00:01.000Z" },
-    }),
-  );
-  expect(TestNotification.sent.map((sent) => sent.title)).toEqual(["Thread completed"]);
-  expect(state.sound).toHaveBeenCalledWith("completion", expect.any(Function));
-});
+it.each([false, true])(
+  "honors quiet completion for notifications and sound (quiet: %s)",
+  async (latestRunQuietCompletion) => {
+    await using app = setup();
+    state.mode = "notifications-and-sound";
+    app.start();
+    state.shells.set(
+      "one",
+      shell({
+        latestRunQuietCompletion,
+        latestTurn: { turnId: "turn", state: "completed", completedAt: "2026-09-13T07:00:01.000Z" },
+      }),
+    );
+    expect(TestNotification.sent.map((sent) => sent.title)).toEqual(
+      latestRunQuietCompletion ? [] : ["Thread completed"],
+    );
+    if (latestRunQuietCompletion) {
+      expect(state.sound).not.toHaveBeenCalled();
+    } else {
+      expect(state.sound).toHaveBeenCalledWith("completion", expect.any(Function));
+    }
+  },
+);
 
 it.each([false, true])(
   "presents one completion when a monitor ends with a final wake (disconnected: %s)",

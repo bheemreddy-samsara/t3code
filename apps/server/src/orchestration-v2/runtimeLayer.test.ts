@@ -380,6 +380,133 @@ const layerLegacyImportTest = Layer.merge(RuntimeLayer.layer, layerProjectionRep
   Layer.provide(layerPlatformTest),
 );
 
+it.effect("captures learnings and settles across silent idle compaction runs", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("auto-settle-learnings");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      createdBy: "user",
+      creationSource: "web",
+      commandId: CommandId.make("create-auto-settle-learnings"),
+      threadId,
+      projectId: ProjectId.make("auto-settle-learnings-project"),
+      title: "Capture learnings",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: "/tmp/auto-settle-learnings",
+      initialMessage: {
+        messageId: MessageId.make("server:auto-settle-learnings:client-message"),
+        text: "Fix the installation.",
+        attachments: [],
+      },
+    });
+    const complete = (run: OrchestrationV2Run, id: string) =>
+      Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        yield* eventSink.write({
+          commandId: CommandId.make(id),
+          events: [
+            {
+              id: EventId.make(id),
+              type: "run.updated",
+              threadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: { ...run, status: "completed", startedAt: now, completedAt: now },
+            },
+          ],
+        });
+      });
+    const compact = Effect.fn("completeIdleCompaction")(function* (id: string) {
+      const messageId = MessageId.make(id);
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(id),
+        threadId,
+        messageId,
+        text: "/compact",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "agent",
+        creationSource: "server",
+        idleCompaction: "beforeCacheExpires",
+      });
+      const run = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+        (candidate) => candidate.userMessageId === messageId,
+      );
+      assert.isDefined(run);
+      yield* complete(run, `${id}-completed`);
+    });
+    const original = (yield* orchestrator.getThreadProjection(threadId)).runs[0];
+    assert.isDefined(original);
+    yield* complete(original, "original-work-completed");
+    yield* compact("compact-original-work");
+    const [beforeCapture] = yield* projections.getSettlementCandidates(threadId);
+    assert.isDefined(beforeCapture);
+    assert.equal(beforeCapture.latestRunId, original.id);
+    assert.isUndefined(beforeCapture.latestRunAutoSettleLearningActivityAt);
+    assert.isUndefined((yield* projections.getThreadShell(threadId))?.latestRunQuietCompletion);
+
+    const activityAt = beforeCapture.updatedAt;
+    assert.isFalse(yield* projections.hasActiveAutoSettleLearningCapture);
+    yield* orchestrator.dispatch({
+      type: "thread.auto-settle.capture-learnings",
+      commandId: CommandId.make("start-learning-capture"),
+      threadId,
+      snapshotAt: beforeCapture.updatedAt,
+      expectedLatestRunId: original.id,
+      activityAt,
+      text: "Save a verified lesson.",
+    });
+    const capturing = yield* orchestrator.getThreadProjection(threadId);
+    assert.isTrue(yield* projections.hasActiveAutoSettleLearningCapture);
+    assert.isNull(capturing.thread.settledOverride);
+    assert.lengthOf(capturing.runs, 3);
+    const capture = capturing.runs.at(-1);
+    assert.isDefined(capture);
+    assert.equal(
+      capturing.messages.find((message) => message.id === capture.userMessageId)?.text,
+      "Save a verified lesson.",
+    );
+    yield* complete(capture, "learning-capture-completed");
+    assert.isFalse(yield* projections.hasActiveAutoSettleLearningCapture);
+    yield* compact("compact-learning-capture");
+
+    const [candidate] = yield* projections.getSettlementCandidates(threadId);
+    const awareness = yield* projections.getAgentAwarenessSnapshot(threadId);
+    assert.isTrue(awareness.threads[0]?.latestRunQuietCompletion);
+    assert.isTrue((yield* projections.getThreadShell(threadId))?.latestRunQuietCompletion);
+    assert.isDefined(candidate);
+    assert.equal(candidate.latestRunId, capture.id);
+    assert.deepEqual(candidate.latestRunAutoSettleLearningActivityAt, activityAt);
+    const stale = yield* orchestrator
+      .dispatch({
+        type: "thread.auto-settle",
+        commandId: CommandId.make("stale-settle-after-learning-capture"),
+        threadId,
+        snapshotAt: candidate.updatedAt,
+        expectedLatestRunId: original.id,
+      })
+      .pipe(Effect.flip);
+    assert.instanceOf(stale, Orchestrator.OrchestratorDispatchError);
+    yield* orchestrator.dispatch({
+      type: "thread.auto-settle",
+      commandId: CommandId.make("settle-after-learning-capture"),
+      threadId,
+      snapshotAt: candidate.updatedAt,
+      expectedLatestRunId: capture.id,
+    });
+    const settled = yield* orchestrator.getThreadProjection(threadId);
+    assert.equal(settled.thread.settledOverride, "settled");
+    assert.lengthOf(settled.runs, 4);
+  }).pipe(Effect.provide(layerTest)),
+);
+
 const layerScheduledTasksTest = ScheduledTaskService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(

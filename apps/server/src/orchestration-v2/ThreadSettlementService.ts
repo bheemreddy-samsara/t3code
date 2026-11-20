@@ -8,18 +8,21 @@ import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 import {
   CommandId,
   isOrchestrationV2WorkActive,
+  resolveProjectProviderInstanceEnabled,
   type ThreadId,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as Cause from "effect/Cause";
+import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FiberSet from "effect/FiberSet";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schedule from "effect/Schedule";
 import * as Semaphore from "effect/Semaphore";
@@ -39,6 +42,7 @@ import { makeNoPullRequestRechecks } from "./noPullRequestRechecks.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { QUIET_AFTER_MS, QUIET_SYNC_INTERVAL_MS } from "./PullRequestSyncReactor.ts";
+import { isTerminalRunStatus } from "./ThreadManagementService.ts";
 
 export interface SettlementPullRequest {
   readonly state: "open" | "closed" | "merged";
@@ -48,6 +52,8 @@ export interface SettlementPullRequest {
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
+const LEARNING_CAPTURE_PROMPT =
+  "T3 Code is preparing to auto-settle this thread. Review the completed work for a verified lesson that would help in a future thread. If one exists, save it using an existing learning or memory destination already authorized by the user or project. If no destination is authorized, leave the short lesson in this reply. If there is no reusable lesson, say so briefly. Keep the lesson free of secrets, personal data, and unverified claims. Limit writes to the authorized learning destination, leave any file changes uncommitted, and finish this turn.";
 
 function toMillis(value: DateTime.Utc | null | undefined): number | null {
   return value == null ? null : DateTime.toEpochMillis(value);
@@ -63,6 +69,17 @@ function latestMillis(values: ReadonlyArray<number | null>): number | null {
 }
 
 function threadActivityAtMs(thread: ProjectionStore.ProjectionSettlementCandidate): number {
+  if (
+    thread.status !== "idle" &&
+    isTerminalRunStatus(thread.status) &&
+    thread.latestRunAutoSettleLearningActivityAt !== undefined &&
+    ProjectionStore.noUserMessageAfterLearningCapture(
+      thread.latestUserAuthoredMessageAt,
+      thread.latestRunRequestedAt,
+    )
+  ) {
+    return DateTime.toEpochMillis(thread.latestRunAutoSettleLearningActivityAt);
+  }
   return (
     latestMillis([
       toMillis(thread.latestUserMessageAt),
@@ -309,6 +326,9 @@ export function autoSettlementSettingsKey(
 }
 
 export const make = Effect.gen(function* () {
+  const saveLearningsOnAutoSettle = yield* Config.Boolean(
+    "T3CODE_SAVE_LEARNINGS_ON_AUTO_SETTLE",
+  ).pipe(Config.withDefault(false), Effect.orDie);
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const projectStore = yield* ProjectStore.ProjectStoreV2;
@@ -342,6 +362,7 @@ export const make = Effect.gen(function* () {
   // Repeated thread.settled retains settledAt; run the action only once per settlement.
   const settleActionRunAt = new Map<ThreadId, number>();
   const noPullRequestRechecks = makeNoPullRequestRechecks();
+  const learningCaptureStart = yield* Semaphore.make(1);
 
   const sweep = Effect.fn("ThreadSettlementServiceV2.sweep")(function* (
     mergedPullRequest: PullRequestService.PullRequestMergeEvent | null,
@@ -383,10 +404,8 @@ export const make = Effect.gen(function* () {
           return null;
         }
         // thread.auto-settle does not recheck settings, so read them per decision; reads are cached.
-        const currentSettings = resolveProjectSettings(
-          yield* settingsService.getSettings,
-          thread.projectId,
-        ).settings;
+        const current = yield* settingsService.getSettings;
+        const currentSettings = resolveProjectSettings(current, thread.projectId).settings;
         const decisionNow = yield* DateTime.now;
         const settledAt = resolveAutoSettlementAt({
           thread,
@@ -400,12 +419,43 @@ export const make = Effect.gen(function* () {
         // A terminal still running a program keeps its thread open; a later sweep settles it.
         if (yield* terminals.hasActiveSubprocess({ threadId: thread.id })) return null;
         const uuid = yield* random.uuidV4();
+        if (
+          saveLearningsOnAutoSettle &&
+          thread.interactionMode === "default" &&
+          thread.status === "completed" &&
+          thread.latestRunId !== null &&
+          thread.latestRunAutoSettleLearningActivityAt === undefined &&
+          resolveProjectProviderInstanceEnabled(
+            current,
+            thread.projectId,
+            thread.providerInstanceId,
+          )
+        ) {
+          const capture = orchestrator.dispatch({
+            type: "thread.auto-settle.capture-learnings",
+            commandId: CommandId.make(`server:auto-settle-capture:${thread.id}:${uuid}`),
+            threadId: thread.id,
+            snapshotAt: thread.updatedAt,
+            expectedLatestRunId: thread.latestRunId,
+            activityAt: DateTime.makeUnsafe(threadActivityAtMs(thread)),
+            text: LEARNING_CAPTURE_PROMPT,
+          });
+          const started = yield* projections.hasActiveAutoSettleLearningCapture.pipe(
+            Effect.flatMap((active) => (active ? Effect.succeed(false) : Effect.as(capture, true))),
+            learningCaptureStart.withPermitsIfAvailable(1),
+          );
+          if (Option.getOrElse(started, () => false)) return null;
+        }
         yield* orchestrator.dispatch({
           type: "thread.auto-settle",
           commandId: CommandId.make(`server:auto-settle:${thread.id}:${uuid}`),
           threadId: thread.id,
           snapshotAt: thread.updatedAt,
           settledAt,
+          ...(thread.latestRunId === null ||
+          thread.latestRunAutoSettleLearningActivityAt === undefined
+            ? {}
+            : { expectedLatestRunId: thread.latestRunId }),
         });
         return null;
       },
@@ -792,9 +842,7 @@ export const make = Effect.gen(function* () {
           ? enqueueThread(event.threadId)
           : Effect.void;
       case "run.updated":
-        return ["completed", "interrupted", "failed", "cancelled", "rolled_back"].includes(
-          event.payload.status,
-        )
+        return isTerminalRunStatus(event.payload.status)
           ? enqueueThread(event.threadId)
           : Effect.void;
       default:
